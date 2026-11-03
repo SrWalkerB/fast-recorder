@@ -218,6 +218,11 @@ void AppController::shutdown() {
     persistSettings();
 
     m_tray.destroy();
+    for (HICON pulseIcon : m_recordingPulseIcons) {
+        if (pulseIcon != nullptr) {
+            DestroyIcon(pulseIcon);
+        }
+    }
     m_webView.close();
 
     if (m_window != nullptr) {
@@ -241,6 +246,16 @@ bool AppController::createMainWindow() {
     m_icon = LoadIconW(m_instance, MAKEINTRESOURCEW(IDI_FAST_RECORD));
     if (m_icon == nullptr) {
         return false;
+    }
+    m_recordingPulseIcons[0] = platform::TrayIcon::createPulseFrame(m_icon, false);
+    m_recordingPulseIcons[1] = platform::TrayIcon::createPulseFrame(m_icon, true);
+    if (m_recordingPulseIcons[0] == nullptr || m_recordingPulseIcons[1] == nullptr) {
+        for (HICON& pulseIcon : m_recordingPulseIcons) {
+            if (pulseIcon != nullptr) {
+                DestroyIcon(pulseIcon);
+                pulseIcon = nullptr;
+            }
+        }
     }
 
     WNDCLASSEXW windowClass{};
@@ -714,6 +729,7 @@ void AppController::syncInterface() {
         L"\"});";
     m_webView.executeScript(script);
     updateTrayTooltip();
+    updateTrayIcon();
 }
 
 void AppController::persistSettings() {
@@ -788,6 +804,7 @@ void AppController::startRecording() {
         m_recordingElapsed = std::chrono::milliseconds{0};
         m_recordingResumedAt = std::chrono::steady_clock::now();
         m_recordingClockRunning = true;
+        m_recordingPulsePhase = false;
     }
     if (result.success) {
         if (m_microphoneEnabled && m_systemAudioEnabled) {
@@ -810,6 +827,7 @@ void AppController::togglePause() {
     const auto result = m_recorder.isPaused() ? m_recorder.resume() : m_recorder.pause();
     m_status = result.message;
     if (result.success) {
+        m_recordingPulsePhase = false;
         if (m_recorder.isPaused()) {
             m_recordingElapsed += std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - m_recordingResumedAt);
@@ -831,6 +849,7 @@ void AppController::stopRecording() {
             std::chrono::steady_clock::now() - m_recordingResumedAt);
     }
     m_recordingClockRunning = false;
+    m_recordingPulsePhase = false;
     const auto result = m_recorder.stop();
     const auto output = m_recorder.outputPath();
     m_status = result.success && !output.empty()
@@ -859,6 +878,16 @@ void AppController::updateTrayTooltip() {
         m_tray.setTooltip(L"Fast Record - gravando");
     } else {
         m_tray.setTooltip(L"Fast Record - pronto");
+    }
+}
+
+void AppController::updateTrayIcon() {
+    if (m_recorder.isRecording() &&
+        m_recordingPulseIcons[0] != nullptr &&
+        m_recordingPulseIcons[1] != nullptr) {
+        m_tray.setIcon(m_recordingPulseIcons[m_recordingPulsePhase ? 1 : 0]);
+    } else {
+        m_tray.setIcon(m_icon);
     }
 }
 
@@ -1170,6 +1199,7 @@ LRESULT AppController::handleMessage(
             if (m_recorder.hasFinished()) {
                 stopRecording();
             } else if (m_recorder.isRecording()) {
+                m_recordingPulsePhase = !m_recordingPulsePhase;
                 syncInterface();
             }
         }

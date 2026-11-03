@@ -1,5 +1,6 @@
 #include "app/AppSettings.h"
 #include "app/UpdateService.h"
+#include "platform/TrayIcon.h"
 #include "recording/AmfBackend.h"
 #include "recording/AmfProbe.h"
 #include "recording/AudioCapture.h"
@@ -11,6 +12,8 @@
 #include <Windows.h>
 
 #include <array>
+#include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -35,6 +38,54 @@ std::wstring testRegistryPath() {
 
 void removeTestRegistryKey(const std::wstring& path) {
     RegDeleteTreeW(HKEY_CURRENT_USER, path.c_str());
+}
+
+std::vector<std::uint8_t> iconColorPixels(HICON icon) {
+    ICONINFO iconInfo{};
+    if (icon == nullptr || !GetIconInfo(icon, &iconInfo)) {
+        return {};
+    }
+
+    std::vector<std::uint8_t> pixels;
+    BITMAP bitmap{};
+    if (iconInfo.hbmColor != nullptr &&
+        GetObjectW(iconInfo.hbmColor, sizeof(bitmap), &bitmap) != 0) {
+        const int width = bitmap.bmWidth;
+        const int height = std::abs(bitmap.bmHeight);
+        if (width > 0 && height > 0) {
+            BITMAPINFO description{};
+            description.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            description.bmiHeader.biWidth = width;
+            description.bmiHeader.biHeight = -height;
+            description.bmiHeader.biPlanes = 1;
+            description.bmiHeader.biBitCount = 32;
+            description.bmiHeader.biCompression = BI_RGB;
+            pixels.resize(static_cast<std::size_t>(width) * height * 4);
+
+            HDC screen = GetDC(nullptr);
+            if (screen == nullptr || GetDIBits(
+                    screen,
+                    iconInfo.hbmColor,
+                    0,
+                    static_cast<UINT>(height),
+                    pixels.data(),
+                    &description,
+                    DIB_RGB_COLORS) != height) {
+                pixels.clear();
+            }
+            if (screen != nullptr) {
+                ReleaseDC(nullptr, screen);
+            }
+        }
+    }
+
+    if (iconInfo.hbmColor != nullptr) {
+        DeleteObject(iconInfo.hbmColor);
+    }
+    if (iconInfo.hbmMask != nullptr) {
+        DeleteObject(iconInfo.hbmMask);
+    }
+    return pixels;
 }
 
 void testSettingsPersistence() {
@@ -336,6 +387,27 @@ void testCapabilityProbes() {
         L"H.264 só é anunciado pela sonda AMF com contexto inicializado");
 }
 
+void testTrayPulseFrames() {
+    const HICON baseIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    const HICON compactPulse = fastrecord::platform::TrayIcon::createPulseFrame(baseIcon, false);
+    const HICON expandedPulse = fastrecord::platform::TrayIcon::createPulseFrame(baseIcon, true);
+    expect(compactPulse != nullptr && expandedPulse != nullptr,
+        L"os dois quadros pulsantes do ícone da bandeja são criados");
+
+    if (compactPulse != nullptr && expandedPulse != nullptr) {
+        const auto compactPixels = iconColorPixels(compactPulse);
+        const auto expandedPixels = iconColorPixels(expandedPulse);
+        expect(!compactPixels.empty() && !expandedPixels.empty() && compactPixels != expandedPixels,
+            L"os quadros do ícone têm aparência diferente para produzir a pulsação");
+    }
+    if (compactPulse != nullptr) {
+        DestroyIcon(compactPulse);
+    }
+    if (expandedPulse != nullptr) {
+        DestroyIcon(expandedPulse);
+    }
+}
+
 void testAmfBackendFailurePath() {
     const auto capability = fastrecord::recording::probeAmf();
     if (capability.h264Supported) {
@@ -465,6 +537,7 @@ int wmain() {
     testRecorderStateMachine();
     testAudioContract();
     testCapabilityProbes();
+    testTrayPulseFrames();
     testAmfBackendFailurePath();
     testUpdateVersionComparison();
     testUpdateReleaseMetadata();

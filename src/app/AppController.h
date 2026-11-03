@@ -68,6 +68,7 @@ private:
     void togglePause();
     void stopRecording();
     void toggleRecording();
+    void updateTrayIcon();
     void updateTrayTooltip();
     void openRecordingsFolder();
     void showAboutDialog();
@@ -90,6 +91,8 @@ private:
     HINSTANCE m_instance{nullptr};
     HWND m_window{nullptr};
     HICON m_icon{nullptr};
+    HICON m_recordingPulseIcons[2]{nullptr, nullptr};
+    bool m_recordingPulsePhase{false};
     HANDLE m_singleInstanceMutex{nullptr};
     bool m_comInitialized{false};
     bool m_shutdownStarted{false};

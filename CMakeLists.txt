@@ -259,6 +259,7 @@ add_executable(fast-record-tests
     tests/FastRecordUnitTests.cpp
     src/app/AppSettings.cpp
     src/app/UpdateService.cpp
+    src/platform/TrayIcon.cpp
     src/recording/AmfBackend.cpp
     src/recording/AmfProbe.cpp
     src/recording/AudioCapture.cpp

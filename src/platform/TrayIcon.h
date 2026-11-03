@@ -18,9 +18,12 @@ public:
     TrayIcon& operator=(const TrayIcon&) = delete;
     ~TrayIcon();
 
+    static HICON createPulseFrame(HICON baseIcon, bool expanded);
+
     bool create(HWND owner, HICON icon, const std::wstring& tooltip, Callback callback);
     void destroy();
 
+    bool setIcon(HICON icon);
     bool setTooltip(const std::wstring& tooltip);
     bool showBalloon(
         const std::wstring& title,
