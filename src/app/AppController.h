@@ -1,6 +1,7 @@
 #pragma once
 
 #include "platform/TrayIcon.h"
+#include "app/UpdateService.h"
 #include "recording/AmfProbe.h"
 #include "recording/NvencProbe.h"
 #include "recording/QsvProbe.h"
@@ -12,7 +13,10 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
 
 namespace fastrecord {
 
@@ -29,10 +33,8 @@ public:
     void shutdown();
 
 private:
-    static constexpr int kRecordHotkeyId = 1;
-    static constexpr int kPauseHotkeyId = 2;
-    static constexpr int kStopHotkeyId = 3;
     static constexpr UINT kShowWindowMessage = WM_APP + 20;
+    static constexpr UINT kUpdateTaskFinishedMessage = WM_APP + 21;
     static constexpr int kWindowWidth = 460;
     static constexpr int kWindowHeight = 570;
     static constexpr wchar_t kWindowClassName[] = L"FastRecord.WebView.MainWindow";
@@ -50,14 +52,15 @@ private:
 
     bool createMainWindow();
     bool createTrayIcon();
-    bool registerHotkeys();
-    void unregisterHotkeys();
     void dockWindowToBottom();
     void showMainWindow();
     void handleTrayEvent(WPARAM eventCode, LPARAM eventData);
     void showTrayMenu();
     void handleCommand(UINT_PTR command);
     void handleWebMessage(const std::wstring& message);
+    void beginUpdateCheck();
+    void beginUpdateDownload();
+    void handleUpdateTaskFinished();
     void syncInterface();
     void persistSettings();
 
@@ -77,14 +80,18 @@ private:
     std::filesystem::path recordingsDirectory() const;
     void refreshRecordings();
 
+    struct UpdateTaskResult {
+        enum class Kind { Check, Download } kind{Kind::Check};
+        updates::CheckResult check;
+        std::filesystem::path installerPath;
+        std::wstring error;
+    };
+
     HINSTANCE m_instance{nullptr};
     HWND m_window{nullptr};
     HICON m_icon{nullptr};
     HANDLE m_singleInstanceMutex{nullptr};
     bool m_comInitialized{false};
-    bool m_recordHotkeyRegistered{false};
-    bool m_pauseHotkeyRegistered{false};
-    bool m_stopHotkeyRegistered{false};
     bool m_shutdownStarted{false};
     bool m_settingsLoaded{false};
     bool m_webViewReady{false};
@@ -102,6 +109,12 @@ private:
     std::chrono::milliseconds m_recordingElapsed{0};
     bool m_recordingClockRunning{false};
     std::wstring m_recordingsJson{L"[]"};
+    updates::CheckResult m_availableUpdate;
+    std::wstring m_updateStatus{L"Verificando atualizações…"};
+    bool m_updateBusy{false};
+    std::thread m_updateThread;
+    std::mutex m_updateResultMutex;
+    std::optional<UpdateTaskResult> m_pendingUpdateResult;
 
     platform::TrayIcon m_tray;
     recording::RecorderController m_recorder;

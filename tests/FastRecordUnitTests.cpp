@@ -1,4 +1,5 @@
 #include "app/AppSettings.h"
+#include "app/UpdateService.h"
 #include "recording/AmfBackend.h"
 #include "recording/AmfProbe.h"
 #include "recording/AudioCapture.h"
@@ -349,9 +350,61 @@ void testAmfBackendFailurePath() {
         L"a seleção AMF falha com diagnóstico quando o runtime/encoder AMD não existe");
 }
 
+void testUpdateVersionComparison() {
+    using fastrecord::updates::isNewerVersion;
+    expect(isNewerVersion(L"0.1.12", L"v0.1.13"),
+        L"o comparador reconhece uma release mais recente com prefixo v");
+    expect(isNewerVersion(L"0.1.12", L"0.1.100"),
+        L"o comparador trata componentes como números e não como texto");
+    expect(!isNewerVersion(L"v0.1.13", L"0.1.13.0"),
+        L"componentes adicionais zerados não tornam a mesma versão mais nova");
+    expect(!isNewerVersion(L"0.1.13", L"0.1.12"),
+        L"o comparador não oferece uma versão anterior para atualização");
+    expect(!isNewerVersion(L"0.1.invalid", L"0.1.14"),
+        L"versões locais fora do formato numérico não são comparadas");
+}
+
+void testUpdateReleaseMetadata() {
+    constexpr std::wstring_view releaseJson = LR"({
+        "tag_name":"v0.1.13",
+        "assets":[{
+            "name":"FastRecord-0.1.13-x64-Setup.exe",
+            "browser_download_url":"https://github.com/srviniaviz/fast-recorder/releases/download/v0.1.13/FastRecord-0.1.13-x64-Setup.exe",
+            "digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "size":1024
+        }]
+    })";
+
+    const auto update = fastrecord::updates::parseLatestReleaseJson(releaseJson, L"0.1.12");
+    expect(update.success && update.updateAvailable && update.version == L"0.1.13",
+        L"uma release válida mais nova aparece como atualização disponível");
+    expect(update.downloadUrl.find(L"https://github.com/srviniaviz/fast-recorder/releases/download/") == 0 &&
+            update.sha256 == std::wstring(64, L'a') && update.sizeBytes == 1024,
+        L"metadados validados preservam URL, SHA-256 e tamanho do setup esperado");
+
+    const auto current = fastrecord::updates::parseLatestReleaseJson(releaseJson, L"0.1.13");
+    expect(current.success && !current.updateAvailable,
+        L"a versão instalada não é marcada como atualização");
+
+    std::wstring wrongUrl(releaseJson);
+    const auto githubHost = wrongUrl.find(L"github.com");
+    wrongUrl.replace(githubHost, 10, L"attacker.invalid");
+    const auto rejectedUrl = fastrecord::updates::parseLatestReleaseJson(wrongUrl, L"0.1.12");
+    expect(!rejectedUrl.success && !rejectedUrl.error.empty(),
+        L"um instalador hospedado fora do endereço oficial é recusado");
+
+    std::wstring missingDigest(releaseJson);
+    const auto digestField = missingDigest.find(L"\"digest\":\"");
+    const auto digestEnd = missingDigest.find(L'\"', digestField + 10);
+    missingDigest.erase(digestField, digestEnd + 1 - digestField);
+    const auto rejectedDigest = fastrecord::updates::parseLatestReleaseJson(missingDigest, L"0.1.12");
+    expect(!rejectedDigest.success && !rejectedDigest.error.empty(),
+        L"uma release sem digest SHA-256 não oferece instalador");
+}
+
 void testUiContract() {
     const std::wstring page(fastrecord::ui::kAppPage);
-    const std::array<const wchar_t*, 28> requiredFragments{
+    const std::array<const wchar_t*, 33> requiredFragments{
         L"id=\"record\"",
         L"id=\"pause\"",
         L"id=\"stop\"",
@@ -380,23 +433,46 @@ void testUiContract() {
         L"AV1 · menor tamanho",
         L"120 FPS",
         L"QSV · Intel",
+        L"id=\"updateStatus\"",
+        L"id=\"updateAction\"",
+        L"check-updates",
+        L"download-update",
+        L"has-update",
     };
 
     for (const auto* fragment : requiredFragments) {
         expect(page.find(fragment) != std::wstring::npos, fragment);
     }
+
+    expect(page.find(L"Ctrl +") == std::wstring::npos &&
+            page.find(L"class=\"shortcut\"") == std::wstring::npos &&
+            page.find(L"class=\"hotkey\"") == std::wstring::npos,
+        L"a interface não anuncia atalhos de teclado para gravação");
+    expect(page.find(L"Gravação rápida") == std::wstring::npos,
+        L"a aba de ações rápidas não oferece gravação por atalho");
 }
 
 } // namespace
 
 int wmain() {
     std::wcout << L"Executando testes unitários do Fast Record...\n";
+    const HRESULT comResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(comResult) && comResult != RPC_E_CHANGED_MODE) {
+        std::wcerr << L"Não foi possível inicializar COM para os testes.\n";
+        return 1;
+    }
     testSettingsPersistence();
     testRecorderStateMachine();
     testAudioContract();
     testCapabilityProbes();
     testAmfBackendFailurePath();
+    testUpdateVersionComparison();
+    testUpdateReleaseMetadata();
     testUiContract();
+
+    if (SUCCEEDED(comResult)) {
+        CoUninitialize();
+    }
 
     if (g_failures == 0) {
         std::wcout << L"OK: todos os testes passaram.\n";

@@ -30,7 +30,7 @@ namespace {
 
 constexpr wchar_t kSingleInstanceName[] = L"Local\\FastRecord.SingleInstance.WebView";
 constexpr wchar_t kWindowTitle[] = L"Fast Record";
-constexpr wchar_t kTrayTooltip[] = L"Fast Record - Ctrl+Shift+R para gravar";
+constexpr wchar_t kTrayTooltip[] = L"Fast Record - painel de gravação";
 
 std::wstring escapeJavaScriptString(const std::wstring& input) {
     std::wostringstream output;
@@ -151,13 +151,6 @@ bool AppController::initialize(bool startHidden) {
         return false;
     }
 
-    if (!registerHotkeys()) {
-        m_tray.showBalloon(
-            L"Fast Record",
-            L"Um ou mais atalhos globais já estão em uso. Os botões da janela continuam disponíveis.",
-            NIIF_WARNING);
-    }
-
     std::wstring appPage(ui::kAppPage);
     const std::wstring versionToken = L"__FASTRECORD_VERSION__";
     const size_t versionPosition = appPage.find(versionToken);
@@ -188,6 +181,7 @@ bool AppController::initialize(bool startHidden) {
         showMainWindow();
     }
     SetTimer(m_window, 1, 250, nullptr);
+    beginUpdateCheck();
     return true;
 }
 
@@ -213,13 +207,16 @@ void AppController::shutdown() {
     }
     m_shutdownStarted = true;
 
+    if (m_updateThread.joinable()) {
+        m_updateThread.join();
+    }
+
     if (m_recorder.isRecording()) {
         m_recorder.stop();
     }
 
     persistSettings();
 
-    unregisterHotkeys();
     m_tray.destroy();
     m_webView.close();
 
@@ -291,42 +288,6 @@ bool AppController::createTrayIcon() {
         m_icon,
         kTrayTooltip,
         [this](LPARAM event) { handleTrayEvent(0, event); });
-}
-
-bool AppController::registerHotkeys() {
-    m_recordHotkeyRegistered = RegisterHotKey(
-        m_window,
-        kRecordHotkeyId,
-        MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT,
-        'R') == TRUE;
-    m_pauseHotkeyRegistered = RegisterHotKey(
-        m_window,
-        kPauseHotkeyId,
-        MOD_CONTROL | MOD_NOREPEAT,
-        'P') == TRUE;
-    m_stopHotkeyRegistered = RegisterHotKey(
-        m_window,
-        kStopHotkeyId,
-        MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT,
-        'S') == TRUE;
-    return m_recordHotkeyRegistered && m_pauseHotkeyRegistered && m_stopHotkeyRegistered;
-}
-
-void AppController::unregisterHotkeys() {
-    if (m_window != nullptr) {
-        if (m_recordHotkeyRegistered) {
-            UnregisterHotKey(m_window, kRecordHotkeyId);
-        }
-        if (m_pauseHotkeyRegistered) {
-            UnregisterHotKey(m_window, kPauseHotkeyId);
-        }
-        if (m_stopHotkeyRegistered) {
-            UnregisterHotKey(m_window, kStopHotkeyId);
-        }
-    }
-    m_recordHotkeyRegistered = false;
-    m_pauseHotkeyRegistered = false;
-    m_stopHotkeyRegistered = false;
 }
 
 void AppController::dockWindowToBottom() {
@@ -461,6 +422,10 @@ void AppController::handleWebMessage(const std::wstring& message) {
     if (message == L"ready") {
         m_webViewReady = true;
         syncInterface();
+    } else if (message == L"check-updates") {
+        beginUpdateCheck();
+    } else if (message == L"download-update") {
+        beginUpdateDownload();
     } else if (message == L"record") {
         startRecording();
     } else if (message == L"pause") {
@@ -592,6 +557,132 @@ void AppController::handleWebMessage(const std::wstring& message) {
     }
 }
 
+void AppController::beginUpdateCheck() {
+    if (m_updateBusy || m_shutdownStarted) {
+        return;
+    }
+    if (m_updateThread.joinable()) {
+        m_updateThread.join();
+    }
+
+    m_updateBusy = true;
+    m_updateStatus = L"Verificando atualizações…";
+    const HWND window = m_window;
+    try {
+        m_updateThread = std::thread([this, window] {
+            UpdateTaskResult result;
+            result.kind = UpdateTaskResult::Kind::Check;
+            result.check = updates::checkForUpdate(FASTRECORD_VERSION);
+            {
+                std::lock_guard lock(m_updateResultMutex);
+                m_pendingUpdateResult = std::move(result);
+            }
+            PostMessageW(window, kUpdateTaskFinishedMessage, 0, 0);
+        });
+    } catch (...) {
+        m_updateBusy = false;
+        m_updateStatus = L"Não foi possível iniciar a verificação de atualizações.";
+    }
+    syncInterface();
+}
+
+void AppController::beginUpdateDownload() {
+    if (m_updateBusy || m_shutdownStarted || !m_availableUpdate.success ||
+        !m_availableUpdate.updateAvailable) {
+        return;
+    }
+    if (m_updateThread.joinable()) {
+        m_updateThread.join();
+    }
+
+    m_updateBusy = true;
+    m_updateStatus = L"Baixando e validando o instalador…";
+    const HWND window = m_window;
+    const updates::CheckResult update = m_availableUpdate;
+    try {
+        m_updateThread = std::thread([this, window, update] {
+            UpdateTaskResult result;
+            result.kind = UpdateTaskResult::Kind::Download;
+            if (!updates::downloadAndVerifyInstaller(update, result.installerPath, result.error)) {
+                result.installerPath.clear();
+            }
+            {
+                std::lock_guard lock(m_updateResultMutex);
+                m_pendingUpdateResult = std::move(result);
+            }
+            PostMessageW(window, kUpdateTaskFinishedMessage, 0, 0);
+        });
+    } catch (...) {
+        m_updateBusy = false;
+        m_updateStatus = L"Não foi possível iniciar o download do instalador.";
+    }
+    syncInterface();
+}
+
+void AppController::handleUpdateTaskFinished() {
+    if (m_updateThread.joinable()) {
+        m_updateThread.join();
+    }
+
+    std::optional<UpdateTaskResult> result;
+    {
+        std::lock_guard lock(m_updateResultMutex);
+        result = std::move(m_pendingUpdateResult);
+        m_pendingUpdateResult.reset();
+    }
+    m_updateBusy = false;
+    if (!result.has_value()) {
+        m_updateStatus = L"A tarefa de atualização terminou sem um resultado.";
+        syncInterface();
+        return;
+    }
+
+    if (result->kind == UpdateTaskResult::Kind::Check) {
+        m_availableUpdate = std::move(result->check);
+        if (!m_availableUpdate.success) {
+            m_updateStatus = m_availableUpdate.error.empty()
+                ? L"Não foi possível verificar atualizações."
+                : m_availableUpdate.error;
+        } else if (m_availableUpdate.updateAvailable) {
+            m_updateStatus = L"Versão " + m_availableUpdate.version + L" disponível.";
+            if (!IsWindowVisible(m_window)) {
+                m_tray.showBalloon(
+                    L"Fast Record",
+                    L"A versão " + m_availableUpdate.version +
+                        L" está disponível. Abra as configurações para atualizar.",
+                    NIIF_INFO);
+            }
+        } else {
+            m_updateStatus = L"Fast Record atualizado · v" +
+                std::wstring(FASTRECORD_VERSION) + L".";
+        }
+        syncInterface();
+        return;
+    }
+
+    if (result->installerPath.empty()) {
+        m_updateStatus = result->error.empty()
+            ? L"Não foi possível baixar e validar o instalador."
+            : result->error;
+        syncInterface();
+        return;
+    }
+
+    const HINSTANCE launchResult = ShellExecuteW(
+        m_window,
+        L"open",
+        result->installerPath.c_str(),
+        nullptr,
+        nullptr,
+        SW_SHOWNORMAL);
+    if (reinterpret_cast<INT_PTR>(launchResult) > 32) {
+        PostQuitMessage(0);
+        return;
+    }
+    m_updateStatus = L"Não foi possível abrir o instalador baixado.";
+    syncInterface();
+}
+
 void AppController::syncInterface() {
     if (!m_webViewReady) {
         return;
@@ -605,6 +696,11 @@ void AppController::syncInterface() {
         L",systemAudio:" + std::wstring(jsonBoolean(m_systemAudioEnabled)) +
         L",pinned:" + std::wstring(jsonBoolean(m_alwaysOnTop)) +
         L",startWithWindows:" + std::wstring(jsonBoolean(m_startWithWindows)) +
+        L",updateAvailable:" + std::wstring(jsonBoolean(
+            m_availableUpdate.success && m_availableUpdate.updateAvailable)) +
+        L",updateBusy:" + std::wstring(jsonBoolean(m_updateBusy)) +
+        L",updateStatus:\"" + escapeJavaScriptString(m_updateStatus) +
+        L"\"" +
         L",elapsedSeconds:" + std::to_wstring(recordingElapsedSeconds()) +
         L",bitrate:" + std::to_wstring(m_bitrateMbps) +
         L",resolution:\"" + escapeJavaScriptString(m_resolution) +
@@ -1063,6 +1159,11 @@ LRESULT AppController::handleMessage(
         return 0;
     }
 
+    if (message == kUpdateTaskFinishedMessage) {
+        handleUpdateTaskFinished();
+        return 0;
+    }
+
     switch (message) {
     case WM_TIMER:
         if (wParam == 1) {
@@ -1086,15 +1187,6 @@ LRESULT AppController::handleMessage(
     case WM_DISPLAYCHANGE:
     case WM_SETTINGCHANGE:
         dockWindowToBottom();
-        return 0;
-    case WM_HOTKEY:
-        if (wParam == kRecordHotkeyId) {
-            toggleRecording();
-        } else if (wParam == kPauseHotkeyId && m_recorder.isRecording()) {
-            togglePause();
-        } else if (wParam == kStopHotkeyId && m_recorder.isRecording()) {
-            stopRecording();
-        }
         return 0;
     case WM_COMMAND:
         handleCommand(LOWORD(wParam));

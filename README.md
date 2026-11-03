@@ -16,7 +16,6 @@ O Fast Record vive na bandeja do sistema e abre um painel compacto quando você 
 ## O que já está pronto
 
 - painel flutuante com acesso pela bandeja do Windows;
-- atalhos globais para gravar, pausar e parar;
 - controles de gravar, pausar e parar;
 - captura do monitor atual em MP4/H.264;
 - opção de AV1 em MP4 quando o NVENC da NVIDIA anuncia suporte ao codec;
@@ -34,17 +33,15 @@ O Fast Record vive na bandeja do sistema e abre um painel compacto quando você 
 - detecção em tempo de execução dos drivers NVENC e AMF;
 - instância única: abrir o executável novamente traz o painel existente para frente.
 
-Atalhos: **Ctrl + Shift + R** inicia ou encerra a gravação, **Ctrl + P** pausa ou continua e **Ctrl + Shift + S** encerra e salva o arquivo.
-
 As preferências ficam em **HKEY_CURRENT_USER\Software\Fast Record**. Nenhuma configuração é enviada para fora do computador.
 
 ## Interface
 
-A janela é nativa em C++, com a camada visual renderizada pelo WebView2. Isso mantém a integração com o Windows — bandeja, atalhos e captura — sem limitar a interface aos controles clássicos do Win32.
+A janela é nativa em C++, com a camada visual renderizada pelo WebView2. Isso mantém a integração com o Windows — bandeja e captura — sem limitar a interface aos controles clássicos do Win32.
 
 ## Por baixo do painel
 
-    TrayIcon + Hotkey
+    TrayIcon + comandos
             │
             ▼
      AppController ───── AppSettings
@@ -104,10 +101,10 @@ Depois de configurar e compilar o projeto, rode a suíte determinística com:
     ctest --test-dir build -C Release --output-on-failure
 
 Ela verifica as preferências salvas no Registro, os estados e erros do
-gravador, o contrato da interface, as regras do áudio e as sondas de NVENC,
-AMF e Intel QSV. Os testes `capture-smoke` e `nvenc-smoke` continuam separados porque
-precisam de uma sessão gráfica, dispositivos de áudio e, no caso do NVENC,
-uma GPU NVIDIA compatível.
+gravador, o contrato da interface, a comparação de versões e os metadados do
+atualizador, as regras do áudio e as sondas de NVENC, AMF e Intel QSV. Os testes
+`capture-smoke` e `nvenc-smoke` continuam separados porque precisam de uma
+sessão gráfica, dispositivos de áudio e, no caso do NVENC, uma GPU NVIDIA compatível.
 
 ## Releases
 
@@ -123,6 +120,12 @@ Cada release publicado no GitHub contém:
 O instalador cria atalhos no Menu Iniciar e na área de trabalho, registra o
 desinstalador e não precisa de privilégios de administrador. O Microsoft Edge
 WebView2 Runtime continua sendo um requisito do Windows.
+
+Nas instalações feitas pelo Setup, o app consulta novas versões ao abrir. A
+aba **Configurações** também permite verificar manualmente e iniciar a
+atualização. Antes de abrir o Setup, o app valida o tamanho e o SHA-256 do
+arquivo publicado. A versão portátil continua sendo atualizada manualmente
+com o ZIP da release.
 
 ### NVENC
 

@@ -43,6 +43,7 @@ add_executable(fast-record WIN32
     src/main.cpp
     src/app/AppController.cpp
     src/app/AppSettings.cpp
+    src/app/UpdateService.cpp
     src/platform/CaptureSelector.cpp
     src/platform/TrayIcon.cpp
     src/platform/WindowsStartup.cpp
@@ -80,6 +81,7 @@ endif()
 target_link_libraries(fast-record PRIVATE
     ${webview2_SOURCE_DIR}/build/native/x64/WebView2LoaderStatic.lib
     advapi32
+    bcrypt
     d3d11
     dxgi
     windowsapp
@@ -95,6 +97,7 @@ target_link_libraries(fast-record PRIVATE
     shlwapi
     user32
     version
+    winhttp
     wmcodecdspuuid
 )
 
@@ -255,6 +258,7 @@ enable_testing()
 add_executable(fast-record-tests
     tests/FastRecordUnitTests.cpp
     src/app/AppSettings.cpp
+    src/app/UpdateService.cpp
     src/recording/AmfBackend.cpp
     src/recording/AmfProbe.cpp
     src/recording/AudioCapture.cpp
@@ -289,6 +293,7 @@ endif()
 target_link_libraries(fast-record-tests PRIVATE
     d3d11
     dxgi
+    bcrypt
     windowsapp
     mf
     mfplat
@@ -301,6 +306,7 @@ target_link_libraries(fast-record-tests PRIVATE
     shlwapi
     user32
     version
+    winhttp
     wmcodecdspuuid
 )
 add_test(NAME fast-record-unit COMMAND fast-record-tests)
