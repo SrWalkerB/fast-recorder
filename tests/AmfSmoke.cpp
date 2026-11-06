@@ -10,6 +10,10 @@
 // --pause=N pauses for N seconds in the middle; the paused time must not
 // appear in the video.
 //
+// --sound-at=N plays a Windows notification sound N seconds into the
+// recording (after a silent start) and checks that the first audible sample
+// of the file lands at N seconds, not at the start of the track.
+//
 // --animate opens a small window that changes color every frame, forcing
 // Windows Graphics Capture to deliver new frames continuously. Without it the
 // desktop is usually static, which exercises the constant-frame-rate path.
@@ -18,6 +22,7 @@
 #include "recording/AmfProbe.h"
 
 #include <Windows.h>
+#include <mmsystem.h>
 #include <mfapi.h>
 #include <mferror.h>
 #include <mfidl.h>
@@ -28,6 +33,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cwchar>
 #include <filesystem>
 #include <iostream>
@@ -50,6 +56,7 @@ struct Options {
     std::uint32_t fps{30};
     std::uint32_t bitrateMbps{12};
     double pauseSeconds{0.0};
+    double soundAtSeconds{-1.0};
     bool animate{false};
     bool microphone{false};
     bool systemAudio{true};
@@ -84,6 +91,8 @@ bool parseOptions(int argc, wchar_t** argv, Options& options) {
             options.bitrateMbps = static_cast<std::uint32_t>(std::wcstoul(argument.c_str() + 10, nullptr, 10));
         } else if (startsWith(argument, L"--pause=")) {
             options.pauseSeconds = std::wcstod(argument.c_str() + 8, nullptr);
+        } else if (startsWith(argument, L"--sound-at=")) {
+            options.soundAtSeconds = std::wcstod(argument.c_str() + 11, nullptr);
         } else if (argument == L"--animate") {
             options.animate = true;
         } else if (argument == L"--mic") {
@@ -190,7 +199,31 @@ struct FileReport {
     double containerSeconds{0};
     StreamReport video;
     StreamReport audio;
+    // Time of the first decoded PCM sample louder than about -30 dBFS.
+    double firstSoundSeconds{-1.0};
 };
+
+constexpr int kAudibleThreshold = 1000;
+
+void findFirstSound(IMFSample* sample, LONGLONG timestamp, UINT32 sampleRate, UINT32 blockAlign, FileReport& report) {
+    if (report.firstSoundSeconds >= 0 || sampleRate == 0 || blockAlign == 0) return;
+    ComPtr<IMFMediaBuffer> buffer;
+    if (FAILED(sample->ConvertToContiguousBuffer(&buffer))) return;
+    BYTE* data = nullptr;
+    DWORD length = 0;
+    if (FAILED(buffer->Lock(&data, nullptr, &length))) return;
+    const auto* samples = reinterpret_cast<const std::int16_t*>(data);
+    const size_t count = length / sizeof(std::int16_t);
+    const size_t channels = blockAlign / sizeof(std::int16_t);
+    for (size_t index = 0; index < count; ++index) {
+        if (std::abs(static_cast<int>(samples[index])) > kAudibleThreshold) {
+            const double frame = static_cast<double>(index / (std::max<size_t>)(1, channels));
+            report.firstSoundSeconds = static_cast<double>(timestamp) / kHundredNanoseconds + frame / sampleRate;
+            break;
+        }
+    }
+    buffer->Unlock();
+}
 
 std::wstring hresultText(const wchar_t* operation, HRESULT result) {
     wchar_t buffer[160]{};
@@ -253,11 +286,19 @@ bool decodeFile(const std::filesystem::path& path, FileReport& report, std::wstr
         result = MFCreateMediaType(&decodedAudio);
         if (SUCCEEDED(result)) result = decodedAudio->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
         if (SUCCEEDED(result)) result = decodedAudio->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+        if (SUCCEEDED(result)) result = decodedAudio->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
         if (SUCCEEDED(result)) result = reader->SetCurrentMediaType(audioStream, nullptr, decodedAudio.Get());
         if (FAILED(result)) {
             error = hresultText(L"Nenhum decodificador aceitou a faixa de áudio", result);
             return false;
         }
+    }
+    UINT32 sampleRate = 0;
+    UINT32 blockAlign = 0;
+    ComPtr<IMFMediaType> currentAudio;
+    if (report.audio.present && SUCCEEDED(reader->GetCurrentMediaType(audioStream, &currentAudio))) {
+        currentAudio->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &sampleRate);
+        currentAudio->GetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, &blockAlign);
     }
 
     for (const DWORD stream : {videoStream, audioStream}) {
@@ -279,6 +320,9 @@ bool decodeFile(const std::filesystem::path& path, FileReport& report, std::wstr
                 return false;
             }
             if (sample) {
+                if (stream == audioStream) {
+                    findFirstSound(sample.Get(), timestamp, sampleRate, blockAlign, report);
+                }
                 LONGLONG sampleDuration = 0;
                 sample->GetSampleDuration(&sampleDuration);
                 ++target.samples;
@@ -340,6 +384,13 @@ int wmain(int argc, wchar_t** argv) {
     }
     // wallSeconds counts only the time spent recording, excluding the pause.
     const auto startedAt = std::chrono::steady_clock::now();
+    std::thread soundPlayer;
+    if (options.soundAtSeconds >= 0.0) {
+        soundPlayer = std::thread([delay = options.soundAtSeconds] {
+            std::this_thread::sleep_for(std::chrono::duration<double>(delay));
+            PlaySoundW(L"C:\\Windows\\Media\\Windows Notify System Generic.wav", nullptr, SND_FILENAME | SND_SYNC);
+        });
+    }
     double pausedSeconds = 0.0;
     if (options.pauseSeconds > 0.0) {
         std::this_thread::sleep_for(std::chrono::duration<double>(options.seconds / 2));
@@ -360,6 +411,7 @@ int wmain(int argc, wchar_t** argv) {
     }
     const double wallSeconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - startedAt).count() - pausedSeconds;
+    if (soundPlayer.joinable()) soundPlayer.join();
     if (!backend.stop(error)) {
         std::wcerr << L"AMF smoke falhou ao parar: " << error << L"\n";
         return 2;
@@ -404,7 +456,11 @@ int wmain(int argc, wchar_t** argv) {
                << L"\n";
     if (report.audio.present) {
         std::wcout << L"Áudio: " << subtypeName(report.audio.subtype) << L", "
-                   << report.audio.samples << L" blocos decodificados, " << audioSeconds << L" s\n";
+                   << report.audio.samples << L" blocos decodificados, " << audioSeconds << L" s";
+        if (report.firstSoundSeconds >= 0) {
+            std::wcout << L", primeiro som em " << report.firstSoundSeconds << L" s";
+        }
+        std::wcout << L"\n";
     } else {
         std::wcout << L"Áudio: sem faixa\n";
     }
@@ -426,15 +482,17 @@ int wmain(int argc, wchar_t** argv) {
         L"o encoder manteve pelo menos 90% dos frames esperados");
     if (!options.microphone && !options.systemAudio) {
         check(!report.audio.present, L"sem fontes de áudio, o arquivo não tem faixa de áudio");
-    } else if (options.microphone) {
-        // The microphone delivers samples continuously, so its track must
-        // cover the whole recording.
-        check(report.audio.present, L"o microfone gerou uma faixa de áudio");
+    } else {
+        // Silence is audio too: the track must cover the whole recording even
+        // when nothing plays on the PC.
+        check(report.audio.present, L"a faixa de áudio existe mesmo com o PC em silêncio");
         check(std::abs(audioSeconds - videoSeconds) <= 0.5,
             L"áudio e vídeo terminam juntos (±0,5 s)");
-    } else if (!report.audio.present) {
-        std::wcout << L"[INFO]   sem faixa de áudio: o loopback do Windows não entrega "
-                      L"amostras enquanto nada está tocando\n";
+    }
+    if (options.soundAtSeconds >= 0.0) {
+        check(report.firstSoundSeconds >= 0 &&
+                std::abs(report.firstSoundSeconds - options.soundAtSeconds) <= 0.5,
+            L"o som tocado no meio da gravação aparece no momento certo (±0,5 s)");
     }
 
     std::wcout << (failures == 0 ? L"RESULTADO: OK\n" : L"RESULTADO: FALHOU\n");

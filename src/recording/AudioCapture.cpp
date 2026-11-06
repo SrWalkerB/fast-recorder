@@ -39,16 +39,78 @@ WAVEFORMATEX captureFormat() {
 
 } // namespace
 
+// WASAPI loopback only delivers packets while the render endpoint is mixing
+// audio. With nothing playing it delivers nothing at all, so silence would
+// vanish from the timeline: a sound played 10 s into the recording would land
+// at 0 s, and the microphone mix would wait for system audio forever.
+// Rendering silence to the same endpoint keeps it mixing, and the loopback
+// stream then reports quiet periods as silent packets.
+struct SilentRenderer {
+    ComPtr<IAudioClient> client;
+    ComPtr<IAudioRenderClient> render;
+    UINT32 bufferFrames{0};
+    bool started{false};
+
+    void stop() noexcept {
+        if (started && client) client->Stop();
+        started = false;
+        render.Reset();
+        client.Reset();
+    }
+
+    bool start(IMMDevice* device) {
+        stop();
+        HRESULT result = device->Activate(
+            __uuidof(IAudioClient),
+            CLSCTX_ALL,
+            nullptr,
+            reinterpret_cast<void**>(client.GetAddressOf()));
+        WAVEFORMATEX* mixFormat = nullptr;
+        if (SUCCEEDED(result)) result = client->GetMixFormat(&mixFormat);
+        // One second of buffer: read() tops it up every few milliseconds, and
+        // a stalled recording thread still has plenty of margin.
+        constexpr REFERENCE_TIME bufferDuration = 10'000'000;
+        if (SUCCEEDED(result)) {
+            result = client->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, bufferDuration, 0, mixFormat, nullptr);
+        }
+        CoTaskMemFree(mixFormat);
+        if (SUCCEEDED(result)) result = client->GetBufferSize(&bufferFrames);
+        if (SUCCEEDED(result)) result = client->GetService(IID_PPV_ARGS(&render));
+        if (SUCCEEDED(result) && !fill()) result = E_FAIL;
+        if (SUCCEEDED(result)) result = client->Start();
+        if (FAILED(result)) {
+            stop();
+            return false;
+        }
+        started = true;
+        return true;
+    }
+
+    // Queues silence for all the free space in the render buffer.
+    bool fill() noexcept {
+        if (!client || !render) return false;
+        UINT32 padding = 0;
+        if (FAILED(client->GetCurrentPadding(&padding))) return false;
+        const UINT32 available = bufferFrames - (std::min)(padding, bufferFrames);
+        if (available == 0) return true;
+        BYTE* data = nullptr;
+        if (FAILED(render->GetBuffer(available, &data))) return false;
+        return SUCCEEDED(render->ReleaseBuffer(available, AUDCLNT_BUFFERFLAGS_SILENT));
+    }
+};
+
 struct AudioSource {
     ComPtr<IMMDevice> device;
     ComPtr<IAudioClient> client;
     ComPtr<IAudioCaptureClient> capture;
+    SilentRenderer silence;
     std::wstring label;
     bool started{false};
 
     void stop() noexcept {
         if (started && client) client->Stop();
         started = false;
+        silence.stop();
         capture.Reset();
         client.Reset();
         device.Reset();
@@ -98,6 +160,9 @@ struct AudioSource {
         }
 
         result = client->GetService(IID_PPV_ARGS(&capture));
+        // Best effort: without it loopback still captures whatever plays, and
+        // the mixer keeps the microphone flowing on its own.
+        if (SUCCEEDED(result) && loopback) silence.start(device.Get());
         if (SUCCEEDED(result)) result = client->Start();
         if (FAILED(result)) {
             error = audioError((std::wstring(L"Não foi possível iniciar ") + label).c_str(), result);
@@ -114,6 +179,7 @@ struct AudioSource {
         pcm.clear();
         frameCount = 0;
         if (!started || !capture) return true;
+        if (silence.started) silence.fill();
 
         UINT32 packetFrames = 0;
         HRESULT result = capture->GetNextPacketSize(&packetFrames);
@@ -228,6 +294,57 @@ bool AudioCapture::start(bool captureMicrophone, bool captureSystemAudio, std::w
     return true;
 }
 
+std::uint32_t AudioCapture::mixPending(
+    std::vector<std::uint8_t>& first,
+    bool firstEnabled,
+    std::vector<std::uint8_t>& second,
+    bool secondEnabled,
+    std::uint32_t maxSkewFrames,
+    std::vector<std::uint8_t>& pcm) {
+    const auto framesIn = [](const std::vector<std::uint8_t>& pending) {
+        return static_cast<std::uint32_t>(pending.size() / kBlockAlignment);
+    };
+    const std::uint32_t firstFrames = firstEnabled ? framesIn(first) : 0;
+    const std::uint32_t secondFrames = secondEnabled ? framesIn(second) : 0;
+
+    std::uint32_t frameCount = 0;
+    if (firstEnabled && secondEnabled) {
+        const auto shorter = (std::min)(firstFrames, secondFrames);
+        const auto longer = (std::max)(firstFrames, secondFrames);
+        // Waiting keeps both sources aligned; giving up after maxSkewFrames
+        // keeps a stalled source from silencing the other one.
+        frameCount = longer - shorter > maxSkewFrames ? longer - maxSkewFrames : shorter;
+    } else {
+        frameCount = firstEnabled ? firstFrames : secondFrames;
+    }
+
+    const size_t mixedBytes = static_cast<size_t>(frameCount) * kBlockAlignment;
+    pcm.assign(mixedBytes, 0);
+    const int sourceCount = static_cast<int>(firstEnabled) + static_cast<int>(secondEnabled);
+    const auto sampleAt = [](const std::vector<std::uint8_t>& pending, size_t index) {
+        std::int16_t sample = 0;
+        if ((index + 1) * sizeof(sample) <= pending.size()) {
+            std::memcpy(&sample, pending.data() + index * sizeof(sample), sizeof(sample));
+        }
+        return static_cast<int>(sample);
+    };
+    const size_t sampleCount = static_cast<size_t>(frameCount) * kChannels;
+    for (size_t index = 0; index < sampleCount; ++index) {
+        const int firstSample = firstEnabled ? sampleAt(first, index) : 0;
+        const int secondSample = secondEnabled ? sampleAt(second, index) : 0;
+        const auto mixed = static_cast<std::int16_t>((firstSample + secondSample) / (std::max)(1, sourceCount));
+        std::memcpy(pcm.data() + index * sizeof(mixed), &mixed, sizeof(mixed));
+    }
+
+    const auto consume = [mixedBytes](std::vector<std::uint8_t>& pending) {
+        const auto bytes = (std::min)(mixedBytes, pending.size());
+        pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(bytes));
+    };
+    if (firstEnabled) consume(first);
+    if (secondEnabled) consume(second);
+    return frameCount;
+}
+
 bool AudioCapture::read(
     std::vector<std::uint8_t>& pcm,
     std::uint32_t& frameCount,
@@ -253,52 +370,13 @@ bool AudioCapture::read(
     m_impl->systemAudioPending.insert(
         m_impl->systemAudioPending.end(), systemPcm.begin(), systemPcm.end());
 
-    const auto microphoneAvailable = static_cast<std::uint32_t>(
-        m_impl->microphonePending.size() / kBlockAlignment);
-    const auto systemAvailable = static_cast<std::uint32_t>(
-        m_impl->systemAudioPending.size() / kBlockAlignment);
-    if (m_impl->microphoneEnabled && m_impl->systemAudioEnabled) {
-        frameCount = (std::min)(microphoneAvailable, systemAvailable);
-    } else {
-        frameCount = m_impl->microphoneEnabled ? microphoneAvailable : systemAvailable;
-    }
-
-    pcm.assign(static_cast<size_t>(frameCount) * kBlockAlignment, 0);
-    const size_t sampleCount = static_cast<size_t>(frameCount) * kChannels;
-    for (size_t index = 0; index < sampleCount; ++index) {
-        std::int16_t microphoneSample = 0;
-        std::int16_t systemSample = 0;
-        if (m_impl->microphoneEnabled) {
-            std::memcpy(
-                &microphoneSample,
-                m_impl->microphonePending.data() + index * sizeof(microphoneSample),
-                sizeof(microphoneSample));
-        }
-        if (m_impl->systemAudioEnabled) {
-            std::memcpy(
-                &systemSample,
-                m_impl->systemAudioPending.data() + index * sizeof(systemSample),
-                sizeof(systemSample));
-        }
-        const int sourceCount = static_cast<int>(m_impl->microphoneEnabled) +
-            static_cast<int>(m_impl->systemAudioEnabled);
-        const auto mixed = (static_cast<int>(microphoneSample) + static_cast<int>(systemSample)) /
-            (std::max)(1, sourceCount);
-        const auto outputSample = static_cast<std::int16_t>(mixed);
-        std::memcpy(pcm.data() + index * sizeof(outputSample), &outputSample, sizeof(outputSample));
-    }
-
-    const size_t consumedBytes = static_cast<size_t>(frameCount) * kBlockAlignment;
-    if (m_impl->microphoneEnabled && consumedBytes > 0) {
-        m_impl->microphonePending.erase(
-            m_impl->microphonePending.begin(),
-            m_impl->microphonePending.begin() + static_cast<std::ptrdiff_t>(consumedBytes));
-    }
-    if (m_impl->systemAudioEnabled && consumedBytes > 0) {
-        m_impl->systemAudioPending.erase(
-            m_impl->systemAudioPending.begin(),
-            m_impl->systemAudioPending.begin() + static_cast<std::ptrdiff_t>(consumedBytes));
-    }
+    frameCount = mixPending(
+        m_impl->microphonePending,
+        m_impl->microphoneEnabled,
+        m_impl->systemAudioPending,
+        m_impl->systemAudioEnabled,
+        kMaxSourceSkewFrames,
+        pcm);
     error.clear();
     return true;
 }

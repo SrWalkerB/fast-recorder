@@ -16,6 +16,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -387,6 +388,70 @@ void testAudioContract() {
     audio.stop();
 }
 
+// Stereo 16-bit PCM where every sample has the same value.
+std::vector<std::uint8_t> pcmFrames(std::uint32_t frames, std::int16_t value) {
+    std::vector<std::uint8_t> pcm(static_cast<size_t>(frames) * fastrecord::recording::AudioCapture::kBlockAlignment);
+    for (size_t offset = 0; offset < pcm.size(); offset += sizeof(value)) {
+        std::memcpy(pcm.data() + offset, &value, sizeof(value));
+    }
+    return pcm;
+}
+
+bool allSamplesEqual(const std::vector<std::uint8_t>& pcm, std::int16_t value) {
+    for (size_t offset = 0; offset + sizeof(value) <= pcm.size(); offset += sizeof(value)) {
+        std::int16_t sample = 0;
+        std::memcpy(&sample, pcm.data() + offset, sizeof(sample));
+        if (sample != value) return false;
+    }
+    return true;
+}
+
+void testAudioMixer() {
+    using fastrecord::recording::AudioCapture;
+    constexpr std::uint32_t skew = 4'800;
+    std::vector<std::uint8_t> pcm;
+
+    auto microphone = pcmFrames(480, 1'000);
+    std::vector<std::uint8_t> system;
+    expect(AudioCapture::mixPending(microphone, true, system, false, skew, pcm) == 480 &&
+            allSamplesEqual(pcm, 1'000) && microphone.empty(),
+        L"só com o microfone, todo o áudio pendente sai sem alteração");
+
+    microphone = pcmFrames(960, 1'000);
+    system = pcmFrames(960, 3'000);
+    expect(AudioCapture::mixPending(microphone, true, system, true, skew, pcm) == 960 &&
+            allSamplesEqual(pcm, 2'000) && microphone.empty() && system.empty(),
+        L"com as duas fontes em dia, o áudio é a média das duas");
+
+    microphone = pcmFrames(2'000, 1'000);
+    system = pcmFrames(500, 3'000);
+    expect(AudioCapture::mixPending(microphone, true, system, true, skew, pcm) == 500 &&
+            microphone.size() / AudioCapture::kBlockAlignment == 1'500 && system.empty(),
+        L"uma fonte um pouco atrasada é aguardada para manter o alinhamento");
+
+    // The reported bug: system audio sends nothing while the PC is silent.
+    microphone = pcmFrames(skew + 2'400, 1'000);
+    system.clear();
+    const auto mixed = AudioCapture::mixPending(microphone, true, system, true, skew, pcm);
+    expect(mixed == 2'400 && allSamplesEqual(pcm, 500) &&
+            microphone.size() / AudioCapture::kBlockAlignment == skew,
+        L"o microfone não fica preso quando o áudio do PC para de chegar");
+
+    microphone.clear();
+    for (int read = 0; read < 100; ++read) {
+        const auto packet = pcmFrames(480, 1'000);
+        microphone.insert(microphone.end(), packet.begin(), packet.end());
+        AudioCapture::mixPending(microphone, true, system, true, skew, pcm);
+    }
+    expect(microphone.size() / AudioCapture::kBlockAlignment <= skew,
+        L"o áudio pendente não cresce sem limite com uma fonte parada");
+
+    microphone = pcmFrames(100, 1'000);
+    system = pcmFrames(100, 1'000);
+    expect(AudioCapture::mixPending(microphone, false, system, false, skew, pcm) == 0 && pcm.empty(),
+        L"sem fontes ativas nada é misturado");
+}
+
 void testCapabilityProbes() {
     const auto nvenc = fastrecord::recording::probeNvenc();
     const auto amf = fastrecord::recording::probeAmf();
@@ -689,6 +754,7 @@ int wmain() {
     testSettingsPersistence();
     testRecorderStateMachine();
     testAudioContract();
+    testAudioMixer();
     testCapabilityProbes();
     testTrayPulseFrames();
     testAmfBackendFailurePath();

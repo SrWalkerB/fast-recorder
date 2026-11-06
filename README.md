@@ -169,7 +169,9 @@ Media Foundation, conferindo codec, resolução, duração e frames entregues:
     build\Release\amf-smoke.exe build\amf-smoke-output --codec=av1 --size=1920x1080 --fps=60 --animate
 
 `--codec=h264|av1`, `--seconds=N`, `--size=WxH`, `--fps=N`, `--bitrate=N`,
-`--pause=N`, `--mic` e `--no-system-audio` ajustam o cenário. `--animate` abre
+`--pause=N`, `--mic` e `--no-system-audio` ajustam o cenário. `--sound-at=N`
+toca um som do Windows N segundos depois do início e confere se ele aparece
+nesse ponto do arquivo, e não no começo da faixa. `--animate` abre
 uma pequena janela que muda de cor a cada frame, para medir a vazão com a tela
 sempre mudando. Validar o AV1 exige a extensão **AV1 Video Extension** da
 Microsoft Store, usada pelo Media Foundation para decodificar.

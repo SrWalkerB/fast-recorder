@@ -277,7 +277,7 @@ if(MSVC)
     target_compile_options(amf-smoke PRIVATE /W4 /permissive- /utf-8)
 endif()
 target_link_libraries(amf-smoke PRIVATE
-    d3d11 dxgi windowsapp mf mfplat mfreadwrite mfuuid ole32 user32 gdi32 wmcodecdspuuid
+    d3d11 dxgi windowsapp mf mfplat mfreadwrite mfuuid ole32 user32 gdi32 winmm wmcodecdspuuid
 )
 
 enable_testing()
