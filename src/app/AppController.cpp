@@ -906,21 +906,26 @@ std::wstring AppController::codecValue() const {
 }
 
 std::wstring AppController::selectedEngineStatus() const {
-    const wchar_t* codec = m_codec == recording::VideoCodec::Av1 ? L"AV1" : L"H.264";
-    if (m_codec == recording::VideoCodec::Av1 && m_recorder.engine() != recording::EncoderEngine::Nvenc) {
-        return L"AV1 nesta versão exige selecionar um encoder NVENC compatível.";
+    const bool av1 = m_codec == recording::VideoCodec::Av1;
+    const wchar_t* codec = av1 ? L"AV1" : L"H.264";
+    const auto engine = m_recorder.engine();
+    if (av1 && (engine == recording::EncoderEngine::Qsv || engine == recording::EncoderEngine::Software)) {
+        return L"AV1 nesta versão exige selecionar um encoder NVENC ou AMF compatível.";
     }
 
-    switch (m_recorder.engine()) {
+    switch (engine) {
     case recording::EncoderEngine::Nvenc:
-        if (m_codec == recording::VideoCodec::Av1 && !m_nvencProbe.av1Supported) {
+        if (av1 && !m_nvencProbe.av1Supported) {
             return m_nvencProbe.description + L" AV1 não está disponível nesta GPU/driver.";
         }
         return m_nvencProbe.description +
             L" A gravação atual usa o backend direto NVENC com " + codec + L".";
     case recording::EncoderEngine::Amf:
+        if (av1 && !m_amfProbe.av1Supported) {
+            return m_amfProbe.description + L" Selecione H.264 para gravar pelo AMF.";
+        }
         return m_amfProbe.description +
-            L" A gravação atual usa o backend direto AMD AMF para H.264.";
+            L" A gravação atual usa o backend direto AMD AMF com " + codec + L".";
     case recording::EncoderEngine::Qsv:
         if (!m_qsvProbe.h264Supported) {
             return m_qsvProbe.description +
@@ -931,11 +936,14 @@ std::wstring AppController::selectedEngineStatus() const {
     case recording::EncoderEngine::Software:
         return std::wstring(L"Compatível com qualquer GPU; utiliza a CPU para ") + codec + L".";
     default:
-        if (m_codec == recording::VideoCodec::Av1) {
+        if (av1) {
             if (m_nvencProbe.av1Supported) {
                 return L"AV1 por NVENC disponível; selecione NVENC para gravar nesse formato.";
             }
-            return L"AV1 requer NVENC compatível; selecione NVENC após atualizar o driver, se necessário.";
+            if (m_amfProbe.av1Supported) {
+                return L"AV1 por AMD AMF disponível; selecione AMF para gravar nesse formato.";
+            }
+            return L"AV1 requer NVENC ou AMF compatível; selecione um deles após atualizar o driver, se necessário.";
         }
         if (m_nvencProbe.h264Supported) {
             return L"H.264 por hardware disponível; o Media Foundation escolherá o encoder.";

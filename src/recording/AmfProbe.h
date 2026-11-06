@@ -9,6 +9,7 @@ struct AmfProbeResult {
     bool sdkBindingsCompiled{false};
     bool contextInitialized{false};
     bool h264Supported{false};
+    bool av1Supported{false};
     std::wstring description;
 };
 

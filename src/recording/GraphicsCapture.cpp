@@ -11,7 +11,7 @@ using namespace winrt;
 using namespace winrt::Windows::Graphics::Capture;
 using namespace winrt::Windows::Graphics::DirectX;
 
-GraphicsCapture::GraphicsCapture(const RecordingSettings& settings)
+GraphicsCapture::GraphicsCapture(const RecordingSettings& settings, CaptureOutputFormat format)
     : m_width(settings.width), m_height(settings.height) {
     if (!GraphicsCaptureSession::IsSupported()) {
         throw hresult_error(E_NOTIMPL, L"Windows Graphics Capture não está disponível neste Windows.");
@@ -57,22 +57,43 @@ GraphicsCapture::GraphicsCapture(const RecordingSettings& settings)
     check_hresult(m_videoDevice->CreateVideoProcessorEnumerator(&content, m_enumerator.put()));
     check_hresult(m_videoDevice->CreateVideoProcessor(m_enumerator.get(), 0, m_processor.put()));
 
+    const bool nv12 = format == CaptureOutputFormat::Nv12;
+    if (nv12) {
+        UINT support = 0;
+        if (FAILED(m_enumerator->CheckVideoProcessorFormat(DXGI_FORMAT_NV12, &support)) ||
+            (support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT) == 0) {
+            throw hresult_error(E_NOTIMPL, L"O processador de vídeo da GPU não gera frames NV12.");
+        }
+    }
+
     D3D11_TEXTURE2D_DESC desc{};
     desc.Width = m_width;
     desc.Height = m_height;
     desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
-    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.Format = nv12 ? DXGI_FORMAT_NV12 : DXGI_FORMAT_B8G8R8A8_UNORM;
     desc.BindFlags = D3D11_BIND_RENDER_TARGET;
     check_hresult(m_device->CreateTexture2D(&desc, nullptr, m_output.put()));
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC view{};
     view.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
     check_hresult(m_videoDevice->CreateVideoProcessorOutputView(
         m_output.get(), m_enumerator.get(), &view, m_outputView.put()));
-    D3D11_TEXTURE2D_DESC stagingDesc = desc;
-    stagingDesc.BindFlags = 0;
-    stagingDesc.Usage = D3D11_USAGE_STAGING;
-    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    check_hresult(m_device->CreateTexture2D(&stagingDesc, nullptr, m_staging.put()));
+    if (!nv12) {
+        D3D11_TEXTURE2D_DESC stagingDesc = desc;
+        stagingDesc.BindFlags = 0;
+        stagingDesc.Usage = D3D11_USAGE_STAGING;
+        stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        check_hresult(m_device->CreateTexture2D(&stagingDesc, nullptr, m_staging.put()));
+    } else {
+        // The desktop is full-range RGB. Players assume BT.709 for HD video
+        // that does not say otherwise, so produce exactly that.
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE input{};
+        input.RGB_Range = 0; // 0-255
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE output{};
+        output.YCbCr_Matrix = 1; // BT.709
+        output.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
+        m_videoContext->VideoProcessorSetStreamColorSpace(m_processor.get(), 0, &input);
+        m_videoContext->VideoProcessorSetOutputColorSpace(m_processor.get(), &output);
+    }
 
     // Fit the entire monitor, preserving aspect ratio; uncovered pixels are black.
     const double scale = std::min(static_cast<double>(m_width) / m_size.Width,
@@ -164,6 +185,9 @@ bool GraphicsCapture::update() {
 }
 
 bool GraphicsCapture::read(std::vector<BYTE>& pixels) {
+    if (!m_staging) {
+        throw hresult_error(E_NOT_VALID_STATE, L"Esta captura entrega frames NV12 somente na GPU.");
+    }
     if (!update()) {
         return false;
     }

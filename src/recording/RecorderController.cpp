@@ -42,9 +42,10 @@ OperationResult RecorderController::start(const RecordingSettings& settings) {
     RecordingSettings effectiveSettings = settings;
     effectiveSettings.engine = m_engine;
 
-    if (settings.codec == VideoCodec::Av1 && m_engine != EncoderEngine::Nvenc) {
+    if (settings.codec == VideoCodec::Av1 &&
+        m_engine != EncoderEngine::Nvenc && m_engine != EncoderEngine::Amf) {
         m_state = RecorderState::Idle;
-        return {false, L"AV1 nesta versão exige selecionar um encoder NVENC compatível."};
+        return {false, L"AV1 nesta versão exige selecionar um encoder NVENC ou AMF compatível."};
     }
 
     m_backend = m_backendFactory(m_engine);

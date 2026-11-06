@@ -8,13 +8,25 @@
 
 namespace fastrecord::recording {
 
+enum class CaptureOutputFormat {
+    // 32-bit BGRA, readable on the CPU through read().
+    Bgra,
+    // NV12 in BT.709 limited range, converted by the GPU video processor.
+    // GPU only: read() is not available in this mode.
+    Nv12,
+};
+
 // Owned exclusively by the recording worker, including the immediate D3D context.
 class GraphicsCapture final {
 public:
-    explicit GraphicsCapture(const RecordingSettings& settings);
+    explicit GraphicsCapture(
+        const RecordingSettings& settings,
+        CaptureOutputFormat format = CaptureOutputFormat::Bgra);
     ~GraphicsCapture();
     GraphicsCapture(const GraphicsCapture&) = delete;
     GraphicsCapture& operator=(const GraphicsCapture&) = delete;
+    // Scales the newest frame into texture(). Returns false when Windows has
+    // not delivered a new frame; texture() then still holds the previous one.
     bool update();
     bool read(std::vector<BYTE>& pixels);
     ID3D11Device* device() const noexcept { return m_device.get(); }

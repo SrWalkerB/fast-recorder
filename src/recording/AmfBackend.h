@@ -9,8 +9,9 @@
 
 namespace fastrecord::recording {
 
-// Direct AMD AMF H.264 path. AMF is loaded from the installed AMD driver at
-// runtime; the application never ships or links against the driver DLL.
+// Direct AMD AMF H.264/AV1 path. AMF is loaded from the installed AMD driver
+// at runtime; the application never ships or links against the driver DLL.
+// The encoded bitstream is muxed by Mp4Writer, the same writer used by NVENC.
 class AmfBackend final : public IRecordingBackend {
 public:
     AmfBackend() = default;

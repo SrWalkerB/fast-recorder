@@ -51,6 +51,7 @@ add_executable(fast-record WIN32
     src/recording/AmfProbe.cpp
     src/recording/AudioCapture.cpp
     src/recording/MediaFoundationBackend.cpp
+    src/recording/Mp4Muxer.cpp
     src/recording/GraphicsCapture.cpp
     src/recording/NvencBackend.cpp
     src/recording/NvencProbe.cpp
@@ -171,6 +172,7 @@ endif()
 add_executable(nvenc-smoke EXCLUDE_FROM_ALL
     tests/NvencSmoke.cpp
     src/recording/AudioCapture.cpp
+    src/recording/Mp4Muxer.cpp
     src/recording/NvencBackend.cpp
     src/recording/GraphicsCapture.cpp
 )
@@ -253,6 +255,31 @@ else()
     set(FASTRECORD_HAS_AMF 0)
 endif()
 
+# Records through AMF and decodes the MP4 again to validate it. Needs an AMD
+# GPU and an interactive desktop session, so it is not part of the CI build.
+add_executable(amf-smoke EXCLUDE_FROM_ALL
+    tests/AmfSmoke.cpp
+    src/recording/AmfBackend.cpp
+    src/recording/AmfProbe.cpp
+    src/recording/AudioCapture.cpp
+    src/recording/GraphicsCapture.cpp
+    src/recording/Mp4Muxer.cpp
+)
+target_include_directories(amf-smoke PRIVATE src)
+if(FASTRECORD_AMF_INCLUDE_DIR)
+    target_include_directories(amf-smoke PRIVATE ${FASTRECORD_AMF_INCLUDE_DIR})
+endif()
+target_compile_definitions(amf-smoke PRIVATE
+    UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00
+    FASTRECORD_HAS_AMF=${FASTRECORD_HAS_AMF}
+)
+if(MSVC)
+    target_compile_options(amf-smoke PRIVATE /W4 /permissive- /utf-8)
+endif()
+target_link_libraries(amf-smoke PRIVATE
+    d3d11 dxgi windowsapp mf mfplat mfreadwrite mfuuid ole32 user32 gdi32 wmcodecdspuuid
+)
+
 enable_testing()
 
 add_executable(fast-record-tests
@@ -265,6 +292,7 @@ add_executable(fast-record-tests
     src/recording/AudioCapture.cpp
     src/recording/GraphicsCapture.cpp
     src/recording/MediaFoundationBackend.cpp
+    src/recording/Mp4Muxer.cpp
     src/recording/NvencBackend.cpp
     src/recording/NvencProbe.cpp
     src/recording/QsvProbe.cpp

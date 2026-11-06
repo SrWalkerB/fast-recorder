@@ -13,6 +13,7 @@
 
 #if FASTRECORD_HAS_AMF
 #include <core/Factory.h>
+#include <components/VideoEncoderAV1.h>
 #include <components/VideoEncoderVCE.h>
 #endif
 
@@ -129,11 +130,32 @@ AmfProbeResult probeAmf() {
         encoder->Terminate();
     }
 
+    // AV1 hardware encoding starts with RDNA 3. 1280x720 fits the 64x16
+    // block alignment of every generation, so the probe does not depend on
+    // the alignment mode; the backend checks the chosen size when recording.
+    amf::AMFComponentPtr av1Encoder;
+    if (factory->CreateComponent(context, AMFVideoEncoder_AV1, &av1Encoder) == AMF_OK &&
+        av1Encoder != nullptr) {
+        if (av1Encoder->SetProperty(
+                AMF_VIDEO_ENCODER_AV1_USAGE,
+                static_cast<amf_int64>(AMF_VIDEO_ENCODER_AV1_USAGE_LOW_LATENCY)) == AMF_OK &&
+            av1Encoder->Init(amf::AMF_SURFACE_NV12, 1280, 720) == AMF_OK) {
+            result.av1Supported = true;
+        }
+        av1Encoder->Terminate();
+    }
+
     context->Terminate();
 
-    result.description = result.h264Supported
-        ? L"AMF disponível para H.264 via Direct3D 11."
-        : L"AMF encontrado, mas o encoder H.264 não foi inicializado.";
+    if (result.h264Supported && result.av1Supported) {
+        result.description = L"AMF disponível para H.264 e AV1 via Direct3D 11.";
+    } else if (result.h264Supported) {
+        result.description = L"AMF disponível para H.264 via Direct3D 11; esta GPU não codifica AV1.";
+    } else if (result.av1Supported) {
+        result.description = L"AMF disponível para AV1 via Direct3D 11; o encoder H.264 não foi inicializado.";
+    } else {
+        result.description = L"AMF encontrado, mas nenhum encoder de vídeo foi inicializado.";
+    }
 #else
     HMODULE library = nullptr;
 #if defined(_WIN64)

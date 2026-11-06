@@ -4,6 +4,7 @@
 #include "recording/AmfBackend.h"
 #include "recording/AmfProbe.h"
 #include "recording/AudioCapture.h"
+#include "recording/Mp4Muxer.h"
 #include "recording/NvencProbe.h"
 #include "recording/QsvProbe.h"
 #include "recording/RecorderController.h"
@@ -11,11 +12,14 @@
 
 #include <Windows.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <vector>
@@ -347,8 +351,21 @@ void testRecorderStateMachine() {
     settings.codec = fastrecord::recording::VideoCodec::Av1;
     const auto av1Result = av1Recorder.start(settings);
     expect(!av1Result.success && av1State.startCalls == 0 &&
-            av1Result.message.find(L"NVENC") != std::wstring::npos,
-        L"AV1 sem NVENC é recusado antes de iniciar o backend");
+            av1Result.message.find(L"NVENC") != std::wstring::npos &&
+            av1Result.message.find(L"AMF") != std::wstring::npos,
+        L"AV1 sem NVENC ou AMF é recusado antes de iniciar o backend");
+
+    FakeBackendState amfAv1State;
+    EncoderEngine selectedAmf = EncoderEngine::Automatic;
+    RecorderController amfAv1Recorder([&](EncoderEngine engine) {
+        selectedAmf = engine;
+        return std::make_unique<FakeBackend>(amfAv1State);
+    });
+    amfAv1Recorder.setEngine(EncoderEngine::Amf);
+    expect(amfAv1Recorder.start(settings).success && selectedAmf == EncoderEngine::Amf &&
+            amfAv1State.lastSettings.codec == fastrecord::recording::VideoCodec::Av1,
+        L"AV1 com AMF chega ao backend AMD");
+    expect(amfAv1Recorder.stop().success, L"o cenário AV1 com AMF simulado pode ser finalizado");
 }
 
 void testAudioContract() {
@@ -385,6 +402,8 @@ void testCapabilityProbes() {
         L"H.264 só é anunciado pela sonda NVENC com uma sessão aberta");
     expect(!amf.h264Supported || amf.contextInitialized,
         L"H.264 só é anunciado pela sonda AMF com contexto inicializado");
+    expect(!amf.av1Supported || amf.contextInitialized,
+        L"AV1 só é anunciado pela sonda AMF com contexto inicializado");
 }
 
 void testTrayPulseFrames() {
@@ -409,17 +428,151 @@ void testTrayPulseFrames() {
 }
 
 void testAmfBackendFailurePath() {
+    auto settings = testRecordingSettings();
+    settings.outputDirectory = std::filesystem::temp_directory_path() / L"FastRecordAmfTest";
+
+    {
+        fastrecord::recording::AmfBackend backend;
+        auto unknownCodec = settings;
+        unknownCodec.codec = static_cast<fastrecord::recording::VideoCodec>(99);
+        std::wstring error;
+        expect(!backend.start(unknownCodec, error) && !error.empty(),
+            L"o backend AMF recusa um codec desconhecido com diagnóstico");
+    }
+
     const auto capability = fastrecord::recording::probeAmf();
+    if (capability.h264Supported && !capability.av1Supported) {
+        fastrecord::recording::AmfBackend backend;
+        auto av1 = settings;
+        av1.codec = fastrecord::recording::VideoCodec::Av1;
+        std::wstring error;
+        expect(!backend.start(av1, error) && error.find(L"AV1") != std::wstring::npos,
+            L"AV1 pelo AMF falha com diagnóstico em GPUs AMD sem encoder AV1");
+    }
     if (capability.h264Supported) {
         return;
     }
 
     fastrecord::recording::AmfBackend backend;
-    auto settings = testRecordingSettings();
-    settings.outputDirectory = std::filesystem::temp_directory_path() / L"FastRecordAmfTest";
     std::wstring error;
     expect(!backend.start(settings, error) && !error.empty(),
         L"a seleção AMF falha com diagnóstico quando o runtime/encoder AMD não existe");
+}
+
+// AV1 sequence header OBU produced by an RX 9070 XT (AMF, 1920x1080, profile
+// 0, level 5.2), as stored at the start of its first key frame.
+const std::vector<std::uint8_t> kAv1SequenceHeaderObu{
+    0x0a, 0x98, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x7b, 0x00, 0x00,
+    0x0e, 0x55, 0x77, 0xf8, 0x6f, 0xd0, 0x02, 0x7d, 0x10, 0x10, 0x10, 0x10, 0x40,
+};
+
+void testAv1Bitstream() {
+    using fastrecord::recording::extractAv1CodecConfiguration;
+    using fastrecord::recording::removeAv1TemporalDelimiters;
+
+    const std::vector<std::uint8_t> temporalDelimiter{0x12, 0x00};
+    const std::vector<std::uint8_t> frame{0x32, 0x02, 0xaa, 0xbb};
+    std::vector<std::uint8_t> temporalUnit = temporalDelimiter;
+    temporalUnit.insert(temporalUnit.end(), kAv1SequenceHeaderObu.begin(), kAv1SequenceHeaderObu.end());
+    temporalUnit.insert(temporalUnit.end(), frame.begin(), frame.end());
+
+    std::vector<std::uint8_t> expectedSample = kAv1SequenceHeaderObu;
+    expectedSample.insert(expectedSample.end(), frame.begin(), frame.end());
+    std::vector<std::uint8_t> sample;
+    expect(removeAv1TemporalDelimiters(temporalUnit, sample) && sample == expectedSample,
+        L"os temporal delimiters saem da amostra AV1 e os demais OBUs ficam intactos");
+    expect(!removeAv1TemporalDelimiters({0x80, 0x00}, sample) && sample.empty(),
+        L"um OBU com o bit proibido ligado é recusado");
+    expect(!removeAv1TemporalDelimiters(temporalDelimiter, sample),
+        L"uma amostra só com temporal delimiter não gera frame vazio");
+
+    std::vector<std::uint8_t> configuration;
+    expect(extractAv1CodecConfiguration(expectedSample, configuration) && configuration.size() == 4 +
+            kAv1SequenceHeaderObu.size(),
+        L"o av1C é montado a partir do cabeçalho de sequência real do AMF");
+    if (configuration.size() == 4 + kAv1SequenceHeaderObu.size()) {
+        expect(configuration[0] == 0x81 && configuration[1] == 0x0e && configuration[2] == 0x0c &&
+                configuration[3] == 0x00,
+            L"o av1C declara perfil 0, nível 5.2, 8 bits e 4:2:0");
+        expect(std::equal(kAv1SequenceHeaderObu.begin(), kAv1SequenceHeaderObu.end(), configuration.begin() + 4),
+            L"o av1C carrega o OBU de cabeçalho de sequência original");
+    }
+    expect(!extractAv1CodecConfiguration(frame, configuration),
+        L"sem cabeçalho de sequência não há av1C");
+}
+
+std::vector<std::uint32_t> readSyncSamples(const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    const std::vector<std::uint8_t> data{
+        std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+    const auto readU32 = [&](size_t offset) {
+        return (static_cast<std::uint32_t>(data[offset]) << 24) |
+            (static_cast<std::uint32_t>(data[offset + 1]) << 16) |
+            (static_cast<std::uint32_t>(data[offset + 2]) << 8) |
+            static_cast<std::uint32_t>(data[offset + 3]);
+    };
+    std::vector<std::uint32_t> samples;
+    for (size_t index = 4; index + 12 <= data.size(); ++index) {
+        if (data[index] == 's' && data[index + 1] == 't' && data[index + 2] == 's' && data[index + 3] == 's') {
+            const auto count = readU32(index + 8);
+            for (std::uint32_t entry = 0; entry < count && index + 16 + entry * 4 <= data.size(); ++entry) {
+                samples.push_back(readU32(index + 12 + entry * 4));
+            }
+            break;
+        }
+    }
+    return samples;
+}
+
+void testMp4WriterSyncSamples() {
+    using fastrecord::recording::Mp4Writer;
+    using fastrecord::recording::VideoCodec;
+    const auto directory = std::filesystem::temp_directory_path() /
+        (L"FastRecordMp4Test_" + std::to_wstring(GetCurrentProcessId()));
+    std::filesystem::create_directories(directory);
+
+    // AV1: the encoder's key frame report decides the sync samples.
+    std::vector<std::uint8_t> keyFrame = kAv1SequenceHeaderObu;
+    keyFrame.insert(keyFrame.end(), {0x32, 0x02, 0xaa, 0xbb});
+    const std::vector<std::uint8_t> interFrame{0x32, 0x02, 0xcc, 0xdd};
+    const auto av1Path = directory / L"av1.mp4";
+    {
+        Mp4Writer writer;
+        std::wstring error;
+        bool written = writer.start(av1Path, 1920, 1080, 30, 12'000'000, VideoCodec::Av1, keyFrame, false, error);
+        written = written && writer.write(keyFrame, 0, error, true);
+        written = written && writer.write(interFrame, 1, error, false);
+        written = written && writer.write(interFrame, 2, error, false);
+        written = written && writer.write(keyFrame, 3, error, true);
+        written = written && writer.finalize(error);
+        expect(written, L"o Mp4Writer grava uma faixa AV1 com dicas de key frame");
+    }
+    expect(readSyncSamples(av1Path) == std::vector<std::uint32_t>{1, 4},
+        L"os key frames AV1 informados pelo encoder viram sync samples");
+
+    // H.264 without hints: IDR NAL units are detected from the bitstream.
+    const std::vector<std::uint8_t> sps{0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x28, 0xac};
+    const std::vector<std::uint8_t> pps{0x00, 0x00, 0x00, 0x01, 0x68, 0xee, 0x3c, 0x80};
+    std::vector<std::uint8_t> idr = sps;
+    idr.insert(idr.end(), pps.begin(), pps.end());
+    idr.insert(idr.end(), {0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84});
+    const std::vector<std::uint8_t> predicted{0x00, 0x00, 0x00, 0x01, 0x41, 0x9a, 0x02};
+    const auto h264Path = directory / L"h264.mp4";
+    {
+        Mp4Writer writer;
+        std::wstring error;
+        bool written = writer.start(h264Path, 1280, 720, 30, 12'000'000, VideoCodec::H264, idr, false, error);
+        written = written && writer.write(idr, 0, error);
+        written = written && writer.write(predicted, 1, error);
+        written = written && writer.write(idr, 2, error);
+        written = written && writer.finalize(error);
+        expect(written, L"o Mp4Writer grava uma faixa H.264 sem dicas de key frame");
+    }
+    expect(readSyncSamples(h264Path) == std::vector<std::uint32_t>{1, 3},
+        L"os IDR do H.264 viram sync samples sem depender do encoder");
+
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
 }
 
 void testUpdateVersionComparison() {
@@ -539,6 +692,8 @@ int wmain() {
     testCapabilityProbes();
     testTrayPulseFrames();
     testAmfBackendFailurePath();
+    testAv1Bitstream();
+    testMp4WriterSyncSamples();
     testUpdateVersionComparison();
     testUpdateReleaseMetadata();
     testUiContract();
